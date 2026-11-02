@@ -19,6 +19,7 @@ import (
 
 	tclog "github.com/openai/tunnel-client/pkg/log"
 	"github.com/openai/tunnel-client/pkg/runtimeconfig"
+	"github.com/openai/tunnel-client/pkg/shutdown"
 )
 
 type stdioCommandTransport struct {
@@ -27,6 +28,11 @@ type stdioCommandTransport struct {
 	shutdowner            fx.Shutdowner
 	observation           *ProtocolObservation
 	observationGeneration string
+
+	// coordinator, when set, delays child termination until the bounded
+	// shutdown drain ended so admitted commands finish (or are reported)
+	// before the stdio process they depend on is reclaimed.
+	coordinator *shutdown.Coordinator
 
 	mu              sync.Mutex
 	commandArgs     []string
@@ -243,10 +249,6 @@ func (t *stdioCommandTransport) stop(ctx context.Context) error {
 	t.mu.Lock()
 	t.stopping = true
 	t.active = false
-	cmd := t.cmd
-	waitDone := t.waitDone
-	stdin := t.stdin
-	stdout := t.stdout
 	started := t.started
 	cancel := t.recoveryCancel
 	recoveryDone := t.recoveryDone
@@ -257,6 +259,41 @@ func (t *stdioCommandTransport) stop(ctx context.Context) error {
 	if cancel != nil {
 		cancel()
 	}
+
+	// Outlive polling cancellation: admitted commands may still be executing
+	// against this child during the bounded shutdown drain. Hook registration
+	// order runs the dispatcher drain hook before this one, so Done is
+	// normally already closed here; the ctx branch is only a backstop so a
+	// misconfigured graph cannot hang shutdown. Termination proceeds no
+	// matter which branch wins so the child is never orphaned.
+	//
+	// When the pipeline never reached its OnStart hook this is a failed-start
+	// rollback: the drain hook will not run and Done never closes, so reclaim
+	// the child immediately instead of burning the rollback budget and
+	// masking the original startup error.
+	if t.coordinator != nil && t.coordinator.PipelineStarted() {
+		select {
+		case <-t.coordinator.Done():
+		case <-ctx.Done():
+		}
+	}
+
+	// Let a concurrent recovery settle (it refuses to spawn replacements
+	// once stopping is set) before deciding which process to terminate.
+	if recoveryDone != nil {
+		select {
+		case <-recoveryDone:
+		case <-ctx.Done():
+		}
+	}
+
+	t.mu.Lock()
+	cmd := t.cmd
+	waitDone := t.waitDone
+	stdin := t.stdin
+	stdout := t.stdout
+	t.mu.Unlock()
+
 	if cmd == nil || !started {
 		return nil
 	}
@@ -264,30 +301,44 @@ func (t *stdioCommandTransport) stop(ctx context.Context) error {
 		t.observation.childClosed(observationGeneration, "child_stopped")
 	}
 
+	return t.terminateChild(ctx, cmd, waitDone, stdin, stdout)
+}
+
+// terminateChild closes the child pipes, asks the process to exit gracefully,
+// and force-kills it if it ignores SIGTERM or the reclamation budget expires.
+// It always reaps the process so shutdown never leaves an orphan.
+func (t *stdioCommandTransport) terminateChild(ctx context.Context, cmd *exec.Cmd, waitDone chan error, stdin io.WriteCloser, stdout io.ReadCloser) error {
 	if stdin != nil {
 		_ = stdin.Close()
 	}
 	if stdout != nil {
 		_ = stdout.Close()
 	}
-	if cmd.Process != nil {
-		_ = cmd.Process.Signal(syscall.SIGTERM)
+	if cmd == nil || cmd.Process == nil {
+		return nil
 	}
 
-	if waitDone != nil {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-waitDone:
-		}
+	_ = cmd.Process.Signal(syscall.SIGTERM)
+	if waitDone == nil {
+		return nil
 	}
-	if recoveryDone != nil {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-recoveryDone:
-		}
+
+	grace := time.NewTimer(stdioChildStopGrace)
+	defer grace.Stop()
+	select {
+	case <-waitDone:
+		t.logInfo(ctx, "stdio MCP command terminated after shutdown")
+		return nil
+	case <-ctx.Done():
+	case <-grace.C:
 	}
+
+	t.logWarn(ctx, "stdio MCP command did not exit after SIGTERM; force killing")
+	if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		t.logWarn(ctx, "failed to kill stdio MCP command", slog.String("error", err.Error()))
+	}
+	// Reap the child so no zombie/worker survives the runtime.
+	<-waitDone
 	return nil
 }
 

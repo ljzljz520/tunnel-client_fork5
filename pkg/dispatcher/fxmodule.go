@@ -5,8 +5,10 @@ package dispatcher
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"slices"
 	"sort"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
@@ -18,6 +20,7 @@ import (
 	"github.com/openai/tunnel-client/pkg/mcpclient"
 	"github.com/openai/tunnel-client/pkg/runtimeconfig"
 	"github.com/openai/tunnel-client/pkg/runtimeharpoon"
+	"github.com/openai/tunnel-client/pkg/shutdown"
 	"github.com/openai/tunnel-client/pkg/types"
 )
 
@@ -78,7 +81,7 @@ var Module = fx.Module(
 		fx.Annotate(newHarpoonChannelBinding, fx.ResultTags(`group:"dispatcher_channel_bindings"`)),
 		newProcessorChannelBindings,
 		dispatcherinternal.NewProcessor,
-		dispatcherinternal.NewQueueListener,
+		newQueueListener,
 		dispatcherinternal.NewActivityHealth,
 		fx.Annotate(func(s *dispatcherinternal.ActivityHealth) healthstate.Component { return s }, fx.ResultTags(`group:"runtime_health_components"`)),
 	),
@@ -280,6 +283,34 @@ func channelNames(channels []types.Channel) []string {
 	return names
 }
 
+type queueListenerParams struct {
+	fx.In
+
+	Logger        *slog.Logger
+	Processor     dispatcherinternal.Processor
+	Queue         controlplane.PolledCommandQueue
+	MCPConfig     *runtimeconfig.MCPConfig
+	ControlPlane  *runtimeconfig.ControlPlaneConfig
+	MeterProvider *sdkmetric.MeterProvider
+	Coordinator   *shutdown.Coordinator `optional:"true"`
+}
+
+// newQueueListener constructs the listener and attaches the shared bounded
+// shutdown-drain contract so admitted commands finish (or are reported) before
+// downstream resources are reclaimed.
+func newQueueListener(p queueListenerParams) (*dispatcherinternal.QueueListener, error) {
+	listener, err := dispatcherinternal.NewQueueListener(p.Logger, p.Processor, p.Queue, p.MCPConfig, p.MeterProvider)
+	if err != nil {
+		return nil, err
+	}
+	var drainTimeout time.Duration
+	if p.ControlPlane != nil {
+		drainTimeout = p.ControlPlane.ShutdownDrainTimeoutOrDefault()
+	}
+	listener.ConfigureShutdown(p.Coordinator, drainTimeout)
+	return listener, nil
+}
+
 type listenerParams struct {
 	fx.In
 
@@ -287,6 +318,7 @@ type listenerParams struct {
 	Listener       *dispatcherinternal.QueueListener
 	QueueHealth    *controlplane.QueueHealth          `optional:"true"`
 	ActivityHealth *dispatcherinternal.ActivityHealth `optional:"true"`
+	Coordinator    *shutdown.Coordinator              `optional:"true"`
 }
 
 func startQueueListener(p listenerParams) error {
@@ -300,12 +332,24 @@ func startQueueListener(p listenerParams) error {
 	p.Lifecycle.Append(fx.Hook{
 		OnStart: func(context.Context) error {
 			p.Listener.Start(ctx)
+			// The pipeline is live: shutdown now honors the bounded drain
+			// contract. Marking only here also lets a failed-start rollback
+			// before this point reclaim resources immediately.
+			p.Coordinator.MarkPipelineStarted()
 			return nil
 		},
-		OnStop: func(context.Context) error {
-			p.ActivityHealth.Accepting(false)
+		OnStop: func(stopCtx context.Context) error {
+			if p.ActivityHealth != nil {
+				p.ActivityHealth.Accepting(false)
+			}
+			// Hand the fx stop deadline to the listener before canceling the
+			// loop: the loop runs the bounded drain under this budget.
+			p.Listener.BeginShutdown(stopCtx)
 			cancel()
 			p.Listener.Wait()
+			if result, ok := p.Listener.DrainResult(); ok && !result.Clean() {
+				return &shutdown.DrainIncompleteError{Result: result}
+			}
 			return nil
 		},
 	})

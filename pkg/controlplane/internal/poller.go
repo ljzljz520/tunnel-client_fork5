@@ -53,6 +53,36 @@ type poller struct {
 	health         *controlplane.PollHealth
 	hadPollError   bool
 	retrySleep     func(context.Context, time.Duration) bool
+
+	// admissionContext supplies the context used to admit a pulled batch into
+	// the queue. It intentionally stays open across the polling-context
+	// cancellation so the final batch returned by the last poll is not lost
+	// in the stop/enqueue race. When nil the poller uses its run context.
+	admissionContext func() context.Context
+}
+
+// AdmissionContextSetter is implemented by pollers that can keep admitting the
+// final polled batch after their polling context was canceled. The fx wiring
+// uses it to attach the shared shutdown coordinator.
+type AdmissionContextSetter interface {
+	SetAdmissionContext(provider func() context.Context)
+}
+
+// SetAdmissionContext attaches the admission-context provider. It must be
+// called before Run.
+func (p *poller) SetAdmissionContext(provider func() context.Context) {
+	p.admissionContext = provider
+}
+
+// admitCtx returns the context that must remain open while a pulled batch
+// enters the queue.
+func (p *poller) admitCtx(runCtx context.Context) context.Context {
+	if p.admissionContext != nil {
+		if adm := p.admissionContext(); adm != nil {
+			return adm
+		}
+	}
+	return runCtx
 }
 
 // NewPoller builds a Poller with sensible defaults for retry and queue
@@ -230,6 +260,11 @@ func (p *poller) Run(ctx context.Context) {
 		enqueued := 0
 		droppedInvalidType := 0
 		droppedContextClosed := 0
+		// The batch was already pulled from the control plane and will not be
+		// re-delivered. Admit it through the admission context, which stays
+		// open after polling was canceled, rather than the run context whose
+		// cancellation races this final enqueue.
+		admitCtx := p.admitCtx(ctx)
 		for idx, cmd := range commands {
 			tc, ok := cmd.(typedCommand)
 			if !ok || tc.commandType() == "" {
@@ -239,7 +274,7 @@ func (p *poller) Run(ctx context.Context) {
 			}
 
 			p.recordCommandAge(ctx, tc)
-			if !p.enqueueWithBackpressure(ctx, tc) {
+			if !p.enqueueWithBackpressure(admitCtx, tc) {
 				// We already pulled this command from the control-plane; if the client is
 				// shutting down we can't safely block forever. Count the remaining
 				// commands as dropped due to context closure.

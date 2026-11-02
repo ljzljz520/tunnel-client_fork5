@@ -25,6 +25,7 @@ import (
 	"github.com/openai/tunnel-client/pkg/app"
 	"github.com/openai/tunnel-client/pkg/config"
 	"github.com/openai/tunnel-client/pkg/controlplane"
+	"github.com/openai/tunnel-client/pkg/shutdown"
 	"github.com/openai/tunnel-client/pkg/types"
 	"github.com/openai/tunnel-client/pkg/version"
 )
@@ -38,13 +39,30 @@ const (
 	maxMaxInFlightRequests       = 10000
 	defaultMCPConnectionMaxTTL   = 10 * time.Minute
 	defaultMCPConcurrentRequests = 10
-	defaultStopTimeout           = 5 * time.Second
+
+	// stopMargin covers fx hooks other than the drain and reclamation
+	// (poller exit, metadata fetcher, metrics) when Run builds its own stop
+	// deadline.
+	stopMargin = 5 * time.Second
 )
 
 var (
 	// ErrClosed is returned when a stopped Client is started again.
 	ErrClosed = errors.New("tunnel-client: client is closed")
+
+	// ErrDrainIncomplete is re-exported from the shared shutdown contract so
+	// embedders can detect, via errors.Is on the error returned by Stop, that
+	// polling stopped but one or more admitted commands could not finish
+	// before the shutdown drain budget expired. Use AsDrainResult to read the
+	// detailed outcome.
+	ErrDrainIncomplete = shutdown.ErrDrainIncomplete
 )
+
+// AsDrainResult extracts the shutdown drain outcome from a Stop error. It
+// returns false when the error is not a drain-incomplete error.
+func AsDrainResult(err error) (shutdown.DrainResult, bool) {
+	return shutdown.AsDrainResult(err)
+}
 
 type TracingConfig = config.TracingConfig
 
@@ -77,6 +95,14 @@ type Config struct {
 	// deadline. Zero uses the tunnel-client runtime default.
 	PollDeadlineGuardrail time.Duration
 
+	// ShutdownDrainTimeout bounds how long Stop keeps processing admitted
+	// commands (and delivering their responses) after polling stops, before
+	// unfinished work is reported and reclaimed. Zero uses the shared runtime
+	// default (30s). The same contract applies to the CLI. The Stop context
+	// must allow for this timeout plus resource reclamation; Run sizes its
+	// own context automatically.
+	ShutdownDrainTimeout time.Duration
+
 	// LogLevel defaults to slog.LevelInfo. LogWriter defaults to os.Stderr.
 	LogLevel  slog.Level
 	LogWriter io.Writer
@@ -85,6 +111,10 @@ type Config struct {
 // Client owns one embedded tunnel-client runtime.
 type Client struct {
 	app *fx.App
+
+	// drainTimeout is the configured bounded-drain budget used to size Run's
+	// stop context.
+	drainTimeout time.Duration
 
 	ready     chan struct{}
 	readyOnce sync.Once
@@ -109,7 +139,10 @@ func New(cfg Config, transport mcp.Transport) (*Client, error) {
 		return nil, err
 	}
 
-	client := &Client{ready: make(chan struct{})}
+	client := &Client{
+		ready:        make(chan struct{}),
+		drainTimeout: internalCfg.ControlPlane.ShutdownDrainTimeoutOrDefault(),
+	}
 	writer := cfg.LogWriter
 	if writer == nil {
 		writer = os.Stderr
@@ -192,8 +225,15 @@ func (c *Client) Done() <-chan os.Signal {
 	return c.app.Done()
 }
 
-// Stop stops polling and MCP forwarding. It is safe to call Stop more than
-// once. A stopped Client cannot be restarted.
+// Stop stops polling and MCP forwarding. It first stops polling, then keeps
+// processing admitted commands until they finish or the configured shutdown
+// drain timeout expires. When work remains unfinished, Stop returns an error
+// wrapping ErrDrainIncomplete; use AsDrainResult for details. It is safe to
+// call Stop more than once. A stopped Client cannot be restarted.
+//
+// The caller-supplied ctx bounds the whole sequence; it should allow at least
+// ShutdownDrainTimeout plus resource-reclamation time. Run sizes that context
+// automatically.
 func (c *Client) Stop(ctx context.Context) error {
 	if c == nil || c.app == nil {
 		return nil
@@ -235,7 +275,9 @@ func (c *Client) Run(ctx context.Context) error {
 	case <-c.Done():
 	}
 
-	stopCtx, cancel := context.WithTimeout(context.Background(), defaultStopTimeout)
+	// Give the bounded drain and terminal resource reclamation (stdio
+	// children are force-killed after the drain) room to complete.
+	stopCtx, cancel := context.WithTimeout(context.Background(), shutdown.FxStopTimeout(c.drainTimeout)+stopMargin)
 	defer cancel()
 	return c.Stop(stopCtx)
 }
@@ -306,6 +348,9 @@ func buildConfig(cfg Config) (*config.Config, error) {
 	if cfg.PollDeadlineGuardrail < 0 {
 		return nil, errors.New("tunnel-client: poll deadline guardrail must be greater than zero")
 	}
+	if cfg.ShutdownDrainTimeout < 0 {
+		return nil, errors.New("tunnel-client: shutdown drain timeout must be greater than zero")
+	}
 	extraHeaders, err := config.NormalizeExtraHeaders("tunnel-client: control-plane extra headers", cfg.ControlPlaneExtraHeaders)
 	if err != nil {
 		return nil, err
@@ -328,6 +373,7 @@ func buildConfig(cfg Config) (*config.Config, error) {
 			MaxInFlightRequests:   maxInFlight,
 			PollTimeout:           cfg.PollTimeout,
 			PollDeadlineGuardrail: cfg.PollDeadlineGuardrail,
+			ShutdownDrainTimeout:  cfg.ShutdownDrainTimeout,
 			ExtraHeaders:          extraHeaders,
 		},
 		Logging: config.LoggingConfig{

@@ -15,6 +15,7 @@ import (
 	"github.com/openai/tunnel-client/pkg/runtimeconfig"
 	"github.com/openai/tunnel-client/pkg/runtimeharpoon"
 	"github.com/openai/tunnel-client/pkg/runtimehealth"
+	"github.com/openai/tunnel-client/pkg/shutdown"
 	"github.com/openai/tunnel-client/pkg/tlsconfig"
 	"github.com/openai/tunnel-client/pkg/tracing"
 	"go.uber.org/fx"
@@ -41,6 +42,8 @@ func Options(cfg *runtimeconfig.Config, opts ...fx.Option) []fx.Option {
 			&cfg.Harpoon,
 		),
 		fx.Provide(func() *tlsconfig.Bundle { return cfg.TLS }),
+		// Shared bounded-drain contract (CLI and SDK use the same graph).
+		shutdown.Module(cfg.ControlPlane.ShutdownDrainTimeoutOrDefault()),
 		log.Module,
 		tracing.Module,
 		dispatcher.Module,

@@ -23,6 +23,7 @@ import (
 	"github.com/openai/tunnel-client/pkg/runtimeharpoon"
 	"github.com/openai/tunnel-client/pkg/runtimeharpoon/hostbus"
 	"github.com/openai/tunnel-client/pkg/runtimehealth"
+	"github.com/openai/tunnel-client/pkg/shutdown"
 	"github.com/openai/tunnel-client/pkg/tlsconfig"
 	"github.com/openai/tunnel-client/pkg/types"
 )
@@ -226,6 +227,7 @@ type pollerParams struct {
 	MeterProvider      *sdkmetric.MeterProvider
 	Health             *controlplane.PollHealth  `optional:"true"`
 	QueueHealth        *controlplane.QueueHealth `optional:"true"`
+	Coordinator        *shutdown.Coordinator     `optional:"true"`
 }
 
 func newPoller(p pollerParams) (internal.Poller, error) {
@@ -240,7 +242,17 @@ func newPoller(p pollerParams) (internal.Poller, error) {
 	}
 	meter := p.MeterProvider.Meter("controlplane")
 	pollTimeout := p.Config.PollTimeoutOrDefault()
-	return internal.NewPoller(queue, p.Fetcher, logger, meter, pollTimeout, p.Config.PollDeadlineGuardrail, p.Config.PollBackoffMin, p.Config.PollBackoffMax, p.Health)
+	poller, err := internal.NewPoller(queue, p.Fetcher, logger, meter, pollTimeout, p.Config.PollDeadlineGuardrail, p.Config.PollBackoffMin, p.Config.PollBackoffMax, p.Health)
+	if err != nil {
+		return nil, err
+	}
+	// Keep the final polled batch admissible while polling is being canceled.
+	if p.Coordinator != nil {
+		if setter, ok := poller.(internal.AdmissionContextSetter); ok {
+			setter.SetAdmissionContext(p.Coordinator.AdmissionContext)
+		}
+	}
+	return poller, nil
 }
 
 type runnerParams struct {
@@ -254,6 +266,7 @@ type runnerParams struct {
 	ControlPlane   *runtimeconfig.ControlPlaneConfig `optional:"true"`
 	StartupCatalog *hostbus.StartupCatalogState      `optional:"true"`
 	HostBus        hostbus.HostRegistrationBus       `optional:"true"`
+	Coordinator    *shutdown.Coordinator             `optional:"true"`
 }
 
 type metadataParams struct {
@@ -344,8 +357,17 @@ func runPoller(p runnerParams) error {
 	p.Lifecycle.Append(fx.Hook{
 		OnStart: func(context.Context) error {
 			logger.InfoContext(ctx, "starting control-plane poller")
+			// Record that polling started before the goroutine launches so a
+			// later failed-start rollback knows the poller hook will mark
+			// polling stopped on its way out.
+			p.Coordinator.MarkPollingActive()
 			go func() {
+				// LIFO: mark polling stopped first, then close done. Marking
+				// happens only once the poller goroutine truly exited, so its
+				// final batch is already admitted — the condition the
+				// dispatcher drain waits for.
 				defer close(done)
+				defer p.Coordinator.MarkPollingStopped()
 				if !waitForMCPStartupBeforePolling(ctx, p.MCPConfig, p.MCPProbeState, logger) {
 					return
 				}
@@ -361,8 +383,14 @@ func runPoller(p runnerParams) error {
 			cancel()
 			select {
 			case <-done:
+				// The goroutine marks polling stopped on its way out; surface
+				// that ordering before the dispatcher hook starts draining.
+				p.Coordinator.MarkPollingStopped()
 				return nil
 			case <-stopCtx.Done():
+				// The poller is still admitting its final batch (queue
+				// backpressure). The goroutine marks polling stopped when it
+				// exits; report the deadline without blocking shutdown.
 				return stopCtx.Err()
 			}
 		},

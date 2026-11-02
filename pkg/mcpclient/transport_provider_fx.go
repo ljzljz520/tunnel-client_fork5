@@ -5,6 +5,8 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"go.uber.org/fx"
+
+	"github.com/openai/tunnel-client/pkg/shutdown"
 )
 
 type injectableProviderParams struct {
@@ -35,12 +37,14 @@ type stdioCommandTransportParams struct {
 	Lifecycle   fx.Lifecycle
 	Shutdowner  fx.Shutdowner
 	Logger      *slog.Logger
-	Observation *ProtocolObservation `optional:"true"`
+	Observation *ProtocolObservation  `optional:"true"`
+	Coordinator *shutdown.Coordinator `optional:"true"`
 }
 
 func newStdioCommandTransportFactoryProvider(p stdioCommandTransportParams) *stdioCommandTransportFactory {
 	factory := newStdioCommandTransportFactory(p.Logger, p.Lifecycle, p.Shutdowner)
 	factory.observation = p.Observation
+	factory.coordinator = p.Coordinator
 	return factory
 }
 

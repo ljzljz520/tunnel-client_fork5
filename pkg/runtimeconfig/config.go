@@ -142,6 +142,7 @@ const (
 	defaultControlPlanePollDeadlineGuardrail           = 5000 * time.Millisecond
 	maxControlPlanePollDeadlineGuardrail               = time.Minute
 	maxControlPlanePollDeadline                        = 10 * time.Minute
+	defaultControlPlaneShutdownDrainTimeout            = 30 * time.Second
 	defaultLogLevel                                    = "info"
 	defaultLogFormat                         LogFormat = LogFormatUnset
 	defaultHealthListenAddr                            = "127.0.0.1:8080"
@@ -304,6 +305,12 @@ type ControlPlaneConfig struct {
 	PollTimeout           time.Duration
 	InitialPollTimeout    time.Duration
 	PollDeadlineGuardrail time.Duration
+	// ShutdownDrainTimeout bounds how long already-admitted commands may keep
+	// processing and posting responses after polling stops. Once the budget
+	// expires, unfinished work is reported and downstream resources (for
+	// example the stdio MCP child process) are reclaimed. Zero uses the
+	// runtime default.
+	ShutdownDrainTimeout time.Duration
 	// PollChannels is an explicit, sorted allowlist of channels to drain. When
 	// PollChannelsConfigured is false, polling remains wire-compatible with
 	// older clients and sends no channel query parameters.
@@ -446,6 +453,15 @@ func (c ControlPlaneConfig) PollDeadlineGuardrailOrDefault() time.Duration {
 		return defaultControlPlanePollDeadlineGuardrail
 	}
 	return c.PollDeadlineGuardrail
+}
+
+// ShutdownDrainTimeoutOrDefault returns the bounded shutdown drain window or
+// its runtime default.
+func (c ControlPlaneConfig) ShutdownDrainTimeoutOrDefault() time.Duration {
+	if c.ShutdownDrainTimeout <= 0 {
+		return defaultControlPlaneShutdownDrainTimeout
+	}
+	return c.ShutdownDrainTimeout
 }
 
 // PollDeadlineTimeoutOrDefault returns the client HTTP/context deadline for one poll cycle.
@@ -637,6 +653,7 @@ func WriteUsage(fs *pflag.FlagSet, w io.Writer) {
 	_, _ = fmt.Fprintln(fs.Output(), "  CONTROL_PLANE_AWS_IDENTITY_PROVIDER_ID, CONTROL_PLANE_AWS_SERVICE_ACCOUNT_ID\tOpenAI IDs for AWS workload identity")
 	_, _ = fmt.Fprintln(fs.Output(), "  OPENAI_API_KEY\tAPI key env var used when CONTROL_PLANE_API_KEY unset")
 	_, _ = fmt.Fprintln(fs.Output(), "  CONTROL_PLANE_TUNNEL_ID\tIdentifier for this client/tunnel (required)")
+	_, _ = fmt.Fprintln(fs.Output(), "  CONTROL_PLANE_SHUTDOWN_DRAIN_TIMEOUT\tMaximum time to finish accepted commands after polling stops (default: 30s)")
 	_, _ = fmt.Fprintln(fs.Output(), "  MCP_SERVER_URL or MCP_COMMAND\tMain MCP target (required unless poll channels exclude main)")
 	_, _ = fmt.Fprintln(fs.Output(), "  MCP_STDIO_FAILURE_POLICY\tRecovery after an unexpected stdio child loss: restart or exit (default: restart)")
 	_, _ = fmt.Fprintln(fs.Output(), "  MCP_FORWARD_TRACE_CONTEXT\tOpt in to forwarding traceparent/tracestate through MCP params._meta (default: false)")
@@ -670,6 +687,7 @@ func RegisterFlags(fs *pflag.FlagSet, flavor Flavor) {
 	fs.Duration("control-plane.poll-timeout", defaultControlPlanePollTimeout, "Long-poll timeout when fetching commands from the control plane (env.CONTROL_PLANE_POLL_TIMEOUT)")
 	fs.Duration("control-plane.initial-poll-timeout", defaultControlPlaneInitialPollTimeout, "Maximum requested wait for the first poll, capped by poll-timeout; does not shorten the client deadline (env.CONTROL_PLANE_INITIAL_POLL_TIMEOUT)")
 	fs.Duration("control-plane.poll-deadline-guardrail", defaultControlPlanePollDeadlineGuardrail, "Extra time after the requested long-poll wait before the control-plane HTTP/context deadline (env.CONTROL_PLANE_POLL_DEADLINE_GUARDRAIL)")
+	fs.Duration("control-plane.shutdown-drain-timeout", defaultControlPlaneShutdownDrainTimeout, "Maximum time to finish already-accepted commands and response delivery after polling stops before unfinished work is reported and resources are reclaimed (env.CONTROL_PLANE_SHUTDOWN_DRAIN_TIMEOUT)")
 	fs.StringArray("control-plane.poll-channel", nil, "Channel to drain from the control plane (repeatable; env.CONTROL_PLANE_POLL_CHANNELS)")
 	fs.StringArray("control-plane.extra-headers", nil, "Additional HTTP headers to send to the tunnel control-plane (format 'Key: Value', repeatable; values accept env:VAR or file:/path) (env.CONTROL_PLANE_EXTRA_HEADERS)")
 	fs.String("log.level", defaultLogLevel, "Log level (debug, info, warn) (env.LOG_LEVEL)")
@@ -1385,6 +1403,26 @@ func buildControlPlaneConfig(fs *pflag.FlagSet, lookupEnv func(string) (string, 
 		}
 		pollDeadlineGuardrail = val
 	}
+	shutdownDrainTimeout := defaultControlPlaneShutdownDrainTimeout
+	if flag := fs.Lookup("control-plane.shutdown-drain-timeout"); flag != nil && flag.Changed {
+		val, err := fs.GetDuration("control-plane.shutdown-drain-timeout")
+		if err != nil {
+			return ControlPlaneConfig{}, fmt.Errorf("invalid value for --control-plane.shutdown-drain-timeout: %w", err)
+		}
+		if val <= 0 {
+			return ControlPlaneConfig{}, errors.New("control-plane.shutdown-drain-timeout must be greater than zero")
+		}
+		shutdownDrainTimeout = val
+	} else if envVal, ok := lookupEnv("CONTROL_PLANE_SHUTDOWN_DRAIN_TIMEOUT"); ok && envVal != "" {
+		val, err := time.ParseDuration(envVal)
+		if err != nil {
+			return ControlPlaneConfig{}, fmt.Errorf("invalid CONTROL_PLANE_SHUTDOWN_DRAIN_TIMEOUT: %w", err)
+		}
+		if val <= 0 {
+			return ControlPlaneConfig{}, errors.New("CONTROL_PLANE_SHUTDOWN_DRAIN_TIMEOUT must be greater than zero")
+		}
+		shutdownDrainTimeout = val
+	}
 	if err := validateControlPlanePollTiming(pollTimeout, pollDeadlineGuardrail); err != nil {
 		return ControlPlaneConfig{}, err
 	}
@@ -1430,6 +1468,7 @@ func buildControlPlaneConfig(fs *pflag.FlagSet, lookupEnv func(string) (string, 
 		PollTimeout:            pollTimeout,
 		InitialPollTimeout:     initialPollTimeout,
 		PollDeadlineGuardrail:  pollDeadlineGuardrail,
+		ShutdownDrainTimeout:   shutdownDrainTimeout,
 		PollChannels:           pollChannels,
 		PollChannelsConfigured: pollChannelsConfigured,
 		ClientCertificate:      clientCertificate,

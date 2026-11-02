@@ -83,6 +83,19 @@ while IFS= read -r line; do
       if [[ -n "${MOCK_MCP_SERVER_REQUEST_BEFORE_RESPONSE_NAME:-}" && "$name" == "$MOCK_MCP_SERVER_REQUEST_BEFORE_RESPONSE_NAME" ]]; then
         printf '{"jsonrpc":"2.0","id":"late-server-request","method":"sampling/createMessage","params":{"messages":[],"maxTokens":1}}\n'
       fi
+      if [[ -n "${MOCK_MCP_DELAY_RESPONSE_NAME:-}" && "$name" == "$MOCK_MCP_DELAY_RESPONSE_NAME" ]]; then
+        sleep "$(awk -v ms="${MOCK_MCP_DELAY_MS:-1000}" 'BEGIN { printf "%.3f", ms / 1000 }')"
+      fi
+      if [[ -n "${MOCK_MCP_HARD_BLOCK_NAME:-}" && "$name" == "$MOCK_MCP_HARD_BLOCK_NAME" ]]; then
+        # Block inside a bash builtin (no child process to orphan) and ignore
+        # SIGTERM so the client's force-kill path is exercised. Opening the
+        # FIFO read-write in this shell never completes the read and never
+        # signals EOF.
+        trap '' TERM
+        exec 3<>"${MOCK_MCP_BLOCK_FIFO:?MOCK_MCP_BLOCK_FIFO required for hard block}"
+        read -r _ <&3
+        continue
+      fi
       message="hello $name"
       printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"%s"}],"structuredContent":{"message":"%s"}}}\n' "$id" "$message" "$message"
       if [[ -n "${MOCK_MCP_EXIT_AFTER_RESPONSE_NAME:-}" && "$name" == "$MOCK_MCP_EXIT_AFTER_RESPONSE_NAME" ]]; then

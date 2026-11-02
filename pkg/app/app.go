@@ -21,6 +21,7 @@ import (
 	"github.com/openai/tunnel-client/pkg/oauth"
 	"github.com/openai/tunnel-client/pkg/process"
 	"github.com/openai/tunnel-client/pkg/proxyhealth"
+	"github.com/openai/tunnel-client/pkg/shutdown"
 	"github.com/openai/tunnel-client/pkg/tlsconfig"
 	"github.com/openai/tunnel-client/pkg/tracing"
 )
@@ -65,6 +66,10 @@ func OptionsWithRuntime(cfg *config.Config, runtime RuntimeOptions, opts ...fx.O
 			&cfg.ProxyHealth,
 		),
 		fx.Provide(func() *tlsconfig.Bundle { return cfg.TLS }),
+		// Install the shared bounded-drain contract before the components that
+		// observe it (poller, dispatcher, stdio). Both CLI and embedded SDK
+		// graphs go through these options.
+		shutdown.Module(cfg.ControlPlane.ShutdownDrainTimeoutOrDefault()),
 		log.Module,
 		tracing.Module,
 		dispatcher.Module,

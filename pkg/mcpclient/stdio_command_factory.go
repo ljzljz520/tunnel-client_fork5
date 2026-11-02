@@ -6,6 +6,7 @@ import (
 
 	"go.uber.org/fx"
 
+	"github.com/openai/tunnel-client/pkg/shutdown"
 	"github.com/openai/tunnel-client/pkg/types"
 )
 
@@ -19,6 +20,7 @@ type stdioCommandTransportFactory struct {
 	lifecycle   fx.Lifecycle
 	shutdowner  fx.Shutdowner
 	observation *ProtocolObservation
+	coordinator *shutdown.Coordinator
 
 	mu         sync.Mutex
 	transports map[types.Channel]*stdioCommandTransport
@@ -41,6 +43,7 @@ func (f *stdioCommandTransportFactory) transportForChannel(channel types.Channel
 		return transport
 	}
 	transport := newStdioCommandTransport(f.logger, f.lifecycle, f.shutdowner)
+	transport.coordinator = f.coordinator
 	if canonical == types.DefaultChannel {
 		transport.observation = f.observation
 	}

@@ -449,6 +449,47 @@ func (h *Harness) ExecuteScenario(t testing.TB) error {
 	return nil
 }
 
+// Start boots the mock servers and tunnel-client without waiting for the
+// scripted scenario to drain. Pair it with StopClient when a test must drive
+// shutdown while commands are in flight.
+func (h *Harness) Start(t testing.TB) {
+	t.Helper()
+	h.startControlPlane(t)
+	h.startMCPServer(t)
+	if h.beforeStart != nil {
+		h.beforeStart(h)
+	}
+	h.startClient(t)
+	if h.afterStart != nil {
+		h.afterStart(h)
+	}
+}
+
+// StopClient stops every harnessed tunnel-client under ctx without failing the
+// test, then closes the mock servers. The joined fx stop error (if any) is
+// returned so tests can assert on drain-incomplete outcomes.
+func (h *Harness) StopClient(ctx context.Context) error {
+	var stopErr error
+	for _, client := range slices.Backward(h.clients) {
+		if client == nil || client.app == nil {
+			continue
+		}
+		stopErr = errors.Join(stopErr, client.app.Stop(ctx))
+		client.app = nil
+	}
+	h.clients = nil
+	h.app = nil
+	if h.MCP != nil && h.mcpStarted {
+		h.MCP.Close()
+		h.mcpStarted = false
+	}
+	if h.ControlPlane != nil && h.tunnelStarted {
+		h.ControlPlane.Close()
+		h.tunnelStarted = false
+	}
+	return stopErr
+}
+
 // WaitForMCPProbe blocks until the startup MCP probe records a result or ctx is canceled.
 func (h *Harness) WaitForMCPProbe(ctx context.Context) error {
 	if h == nil || h.MCPProbeState == nil {
